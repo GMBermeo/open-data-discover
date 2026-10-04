@@ -48,9 +48,12 @@ uv run -m db.cli shell
 
 ### 3. Querying from Python
 
+By default, `TorontoDuckDB` connections are **read-only**, allowing multiple concurrent readers (Python scripts, DuckDB UI, CLI) without file locking conflicts:
+
 ```python
 from db.instance import TorontoDuckDB
 
+# Connects in read-only mode by default
 manager = TorontoDuckDB("db/toronto_opendata.duckdb")
 con = manager.connect()
 
@@ -59,9 +62,20 @@ df = con.execute("SELECT * FROM bicycle_parking_racks.data_4326 LIMIT 10").df()
 print(df)
 ```
 
-### 4. External SQL Clients (DBeaver, Harlequin, DuckDB CLI)
+### 4. External SQL Clients & DuckDB UI
 
-You can open `db/toronto_opendata.duckdb` directly with any standard DuckDB client:
-- **Harlequin**: `harlequin db/toronto_opendata.duckdb`
-- **DuckDB CLI**: `duckdb db/toronto_opendata.duckdb`
-- **DBeaver**: Connect using the DuckDB JDBC driver pointing to `db/toronto_opendata.duckdb`.
+Because DuckDB enforces strict single-writer file locking on Windows, external tools should always attach or open the file in **read-only mode** to allow concurrent querying:
+
+- **DuckDB UI (Web)**:
+  Launch the UI with the read-only flag:
+  ```bash
+  duckdb -readonly db/toronto_opendata.duckdb -ui
+  ```
+  Or attach inside an existing DuckDB UI notebook:
+  ```sql
+  ATTACH 'db/toronto_opendata.duckdb' AS toronto (READ_ONLY);
+  USE toronto;
+  ```
+- **DuckDB CLI**: `duckdb -readonly db/toronto_opendata.duckdb`
+- **Harlequin**: `harlequin --read-only db/toronto_opendata.duckdb`
+- **DBeaver**: Configure the connection with `duckdb.read_only=true`.

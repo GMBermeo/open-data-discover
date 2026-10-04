@@ -175,6 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("download/data"),
         help="path to downloaded data folder (default: download/data)",
     )
+    parser.add_argument(
+        "--read-write",
+        action="store_true",
+        help="open database with write access (default: read-only)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -199,7 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    manager = TorontoDuckDB(db_path=args.db, data_dir=args.data)
+    manager = TorontoDuckDB(db_path=args.db, data_dir=args.data, read_only=not args.read_write)
     return args.func(manager, args)
 
 

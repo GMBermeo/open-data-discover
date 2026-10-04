@@ -51,8 +51,13 @@ def main(argv=None) -> int:
     console.print(f"  DuckDB Path:    [yellow]{args.db}[/yellow]")
     console.print(f"  Mode:           [magenta]{'Materialized Tables' if args.materialize else 'Zero-Copy Views'}[/magenta]\n")
 
-    manager = TorontoDuckDB(db_path=args.db, data_dir=args.data)
-    stats = manager.sync_all(materialize=args.materialize)
+    manager = TorontoDuckDB(db_path=args.db, data_dir=args.data, read_only=False)
+
+    with console.status("[bold cyan]Synchronizing datasets into DuckDB...[/bold cyan]") as status:
+        def on_progress(idx: int, total: int, pkg_name: str, views: int) -> None:
+            status.update(f"[bold cyan][{idx}/{total}][/bold cyan] Registering [yellow]{pkg_name}[/yellow] ([green]{views} view(s)[/green])")
+
+        stats = manager.sync_all(materialize=args.materialize, progress_callback=on_progress)
 
     table = Table(title="DuckDB Synchronization Summary", show_header=True, header_style="bold magenta")
     table.add_column("Metric", style="dim")

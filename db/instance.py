@@ -49,23 +49,31 @@ class TorontoDuckDB:
         self,
         db_path: Path | str = "db/toronto_opendata.duckdb",
         data_dir: Path | str = "download/data",
+        read_only: bool = True,
     ):
         self.db_path = Path(db_path)
         self.data_dir = Path(data_dir)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def connect(self) -> duckdb.DuckDBPyConnection:
+    def connect(self, read_only: Optional[bool] = None) -> duckdb.DuckDBPyConnection:
         """Connect to DuckDB and load necessary extensions."""
-        con = duckdb.connect(str(self.db_path))
-        self.init_extensions(con)
-        self.init_metadata_schema(con)
+        ro = self.read_only if read_only is None else read_only
+        con = duckdb.connect(str(self.db_path), read_only=ro)
+        self.init_extensions(con, read_only=ro)
+        if not ro:
+            self.init_metadata_schema(con)
         return con
 
-    def init_extensions(self, con: duckdb.DuckDBPyConnection) -> None:
+    def init_extensions(self, con: duckdb.DuckDBPyConnection, read_only: bool = False) -> None:
         """Install and load required DuckDB extensions."""
         for ext in ("spatial", "excel"):
             try:
-                con.execute(f"INSTALL {ext}; LOAD {ext};")
+                if read_only:
+                    con.execute(f"LOAD {ext};")
+                else:
+                    con.execute(f"INSTALL {ext}; LOAD {ext};")
             except Exception as e:
                 log.warning("Could not load DuckDB extension %s: %s", ext, e)
 
@@ -166,14 +174,26 @@ class TorontoDuckDB:
             candidates.append(f"SELECT * FROM read_json_auto('{posix_path}', ignore_errors=true)")
             candidates.append(f"SELECT * FROM ST_Read('{posix_path}')")
 
-        elif ext == "zip" or (ext == "zip" and fmt_upper == "SHP"):
-            candidates.append(f"SELECT * FROM ST_Read('/vsizip/{posix_path}')")
+        elif ext == "zip" or fmt_upper in ("ZIP", "SHP"):
+            try:
+                import zipfile
+                with zipfile.ZipFile(file_path, "r") as zf:
+                    names = [n for n in zf.namelist() if not n.endswith("/")]
+                    exts = set(Path(n).suffix.lower() for n in names)
+                    if any(e in (".shp", ".gdb", ".gdbtable", ".kml", ".gpkg") for e in exts):
+                        candidates.append(f"SELECT * FROM ST_Read('/vsizip/{posix_path}')")
+                    elif any(e in (".geojson",) for e in exts):
+                        candidates.append(f"SELECT * FROM ST_Read('/vsizip/{posix_path}')")
+            except Exception as e:
+                log.debug("Error inspecting zip %s: %s", file_path, e)
 
-        elif ext in ("gpkg", "shp") or fmt_upper in ("GPKG", "SHP"):
+        elif ext in ("gpkg", "shp", "kml") or fmt_upper in ("GPKG", "SHP", "KML"):
             candidates.append(f"SELECT * FROM ST_Read('{posix_path}')")
 
-        elif ext in ("xlsx", "xlsm") or fmt_upper in ("XLSX", "XLSM"):
+        elif ext in ("xlsx", "xlsm", "xls") or fmt_upper in ("XLSX", "XLSM", "XLS"):
+            candidates.append(f"SELECT * FROM read_xlsx('{posix_path}', all_varchar=true)")
             candidates.append(f"SELECT * FROM read_xlsx('{posix_path}')")
+            candidates.append(f"SELECT * FROM ST_Read('{posix_path}')")
 
         return candidates
 
@@ -219,6 +239,41 @@ class TorontoDuckDB:
 
             candidate_sqls = self._candidate_queries_for_resource(file_path, fmt)
             if not candidate_sqls:
+                err_msg = f"Non-tabular or unsupported format ({fmt})"
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO metadata.resources
+                    (resource_id, package_name, name, format, file_name, file_path, file_bytes,
+                     schema_name, view_name, is_view_active, error, registered_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+                    """,
+                    [
+                        rid,
+                        pkg_name,
+                        r_name,
+                        fmt,
+                        fname,
+                        str(file_path),
+                        finfo.get("bytes"),
+                        schema_name,
+                        view_name,
+                        False,
+                        err_msg,
+                    ],
+                )
+                registrations.append(
+                    ResourceRegistration(
+                        package_name=pkg_name,
+                        resource_id=rid,
+                        resource_name=r_name,
+                        format=fmt,
+                        file_path=file_path,
+                        schema_name=schema_name,
+                        view_name=view_name,
+                        success=False,
+                        error=err_msg,
+                    )
+                )
                 continue
 
             cmd_type = "TABLE" if materialize else "VIEW"
@@ -281,9 +336,13 @@ class TorontoDuckDB:
 
         return registrations
 
-    def sync_all(self, materialize: bool = False) -> Dict[str, Any]:
+    def sync_all(
+        self,
+        materialize: bool = False,
+        progress_callback: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Scan all downloaded packages, sync metadata, and register all views."""
-        con = self.connect()
+        con = self.connect(read_only=False)
         try:
             cat_count = self.sync_catalog(con)
 
@@ -292,20 +351,31 @@ class TorontoDuckDB:
             packages_registered = 0
 
             if self.data_dir.is_dir():
-                for pdir in sorted(self.data_dir.iterdir()):
-                    if pdir.is_dir() and not pdir.name.startswith("."):
-                        marker = pdir / ".download"
-                        pkg_json = pdir / "package.json"
-                        # Only register completed packages
-                        if pkg_json.is_file() and not marker.exists():
-                            regs = self.register_package(con, pdir, materialize=materialize)
-                            if regs:
-                                packages_registered += 1
-                                for r in regs:
-                                    if r.success:
-                                        total_views += 1
-                                    else:
-                                        failed_views += 1
+                pkg_dirs = [
+                    pdir for pdir in sorted(self.data_dir.iterdir())
+                    if pdir.is_dir()
+                    and not pdir.name.startswith(".")
+                    and (pdir / "package.json").is_file()
+                    and not (pdir / ".download").exists()
+                ]
+
+                total_pkgs = len(pkg_dirs)
+                for idx, pdir in enumerate(pkg_dirs, 1):
+                    regs = self.register_package(con, pdir, materialize=materialize)
+                    active_count = sum(1 for r in regs if r.success)
+                    if regs:
+                        packages_registered += 1
+                        for r in regs:
+                            if r.success:
+                                total_views += 1
+                            else:
+                                failed_views += 1
+
+                    if progress_callback:
+                        progress_callback(idx, total_pkgs, pdir.name, active_count)
+
+            # Flush WAL completely to main database file
+            con.execute("CHECKPOINT;")
 
             return {
                 "catalog_packages": cat_count,
